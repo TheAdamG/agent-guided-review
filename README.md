@@ -1,4 +1,4 @@
-# nvim_review
+# agent-guided-review
 
 **Let your coding agent guide you through changes in your existing Neovim.**
 
@@ -58,6 +58,8 @@ is needed; the agent uses its normal shell tool to run the bridge.
 - A local POSIX environment. Tested on Linux; macOS is not yet verified. Native
   Windows and cross-machine editor control are not supported.
 - Claude Code or OpenCode with skill discovery and permission to run the bridge.
+  Other harnesses may work but are not officially supported; see
+  [other agent harnesses](#other-agent-harnesses).
 - Optional: [gitsigns.nvim](https://github.com/lewis6991/gitsigns.nvim), configured
   normally, for its floating hunk preview. Without it, the bridge shows a bounded
   popup of previous source instead.
@@ -67,41 +69,86 @@ or Neovim Python provider is needed.
 
 ## Installation
 
-There are **three parts to install**: the Lua plugin, the command on PATH, and the
-agent skill. Installing the Lazy plugin alone does not install the other two.
+### Recommended: lazy.nvim
 
-### Option A: one local checkout, managed with Lazy
-
-Before this project is published, use your existing checkout. Once published,
-replace `YOUR_GITHUB_USERNAME` below with the actual GitHub owner:
-
-```sh
-git clone https://github.com/YOUR_GITHUB_USERNAME/nvim_review.git ~/dev/nvim_review
-```
-
-Add this to your [lazy.nvim](https://github.com/folke/lazy.nvim) specifications:
+Add this to your [lazy.nvim](https://github.com/folke/lazy.nvim) plugin specs:
 
 ```lua
 {
-  dir = vim.fn.expand("~/dev/nvim_review"),
+  "TheAdamG/agent-guided-review",
   name = "nvim-review",
   main = "guided-review",
   lazy = false,
-  opts = {
-    quiet_ms = 800,
-  },
+  opts = {},
+  build = "python3 scripts/install.py --skills opencode claude",
 }
 ```
 
-`main` is explicit because the repository name and Lua module name differ. Run
-`:Lazy sync`, then install the command and skills from that same checkout:
+Run **`:Lazy sync`**. Lazy downloads the plugin, runs setup, and uses the build
+step to install the `nvim-review` command and the skill for both agents. No manual
+clone or separate installer command is needed. If you only use one agent, remove
+`opencode` or `claude` from the build command.
+
+Ensure **`~/.local/bin` is on PATH** in the shell where your agent runs. Then
+continue to [your first review](#first-review).
+
+The command and skills are symlinked to Lazy's checkout, so they stay together
+when updated. The installer refuses to overwrite unrelated files or existing
+installations from another checkout. `main` is explicit because the repository
+and Lua module names differ. If the plugin was already installed before adding
+`build`, run `:Lazy build nvim-review` once.
+
+### Other agent harnesses
+
+**OpenCode and Claude Code are officially supported.** The Neovim plugin and
+Python bridge are harness-independent, and both agents use the same portable
+skill. Other harnesses may work, but have not been verified end to end. They need
+skill loading, shell-command access, and permission to reach the local Neovim
+socket.
+
+For harnesses supported by the [Skills CLI](https://skills.sh/), install just the
+skill with:
 
 ```sh
-cd ~/dev/nvim_review
+npx skills add TheAdamG/agent-guided-review --skill guided-review -g
+```
+
+This requires Node.js 22.20+ and lets you choose the target agent. It installs
+**only the skill**, not the Neovim plugin or `nvim-review` command. Install those
+using the Lazy spec above with `build = "python3 scripts/install.py"` instead,
+or use the manual instructions below. Do not install the same skill with both
+installers. Separately installed skills must be kept in sync with the plugin and
+bridge.
+
+Alternatively, copy or symlink the **whole** `skills/guided-review` directory,
+including `references`, into your harness's skill directory. Compatibility is
+not an official support guarantee.
+
+### Advanced: local checkout or other plugin managers
+
+<details>
+<summary>Manual installation and installer options</summary>
+
+Clone the repository and install the command and skills:
+
+```sh
+git clone https://github.com/TheAdamG/agent-guided-review.git ~/dev/agent-guided-review
+cd ~/dev/agent-guided-review
 python3 scripts/install.py --skills opencode claude
 ```
 
-The installer creates these symlinks:
+For Lazy, use `dir = vim.fn.expand("~/dev/agent-guided-review")` in place of
+`"TheAdamG/agent-guided-review"` in the recommended spec. For other plugin managers,
+add that checkout as a local plugin and call `require("guided-review").setup()`.
+Without a plugin manager, load it directly:
+
+```lua
+vim.opt.rtp:prepend(vim.fn.expand("~/dev/agent-guided-review"))
+require("guided-review").setup()
+```
+
+Use the same checkout for the plugin, command and skill. The installer creates
+these symlinks:
 
 ```text
 ~/.local/bin/nvim-review
@@ -127,45 +174,7 @@ Running without `--skills` installs only the command. The installer is idempoten
 for its own links and **refuses to overwrite any existing file, directory, or
 unrelated symlink**. It does not download dependencies or edit agent settings.
 
-### Option B: let Lazy clone the published repository
-
-Once the remote exists, use this instead of Option A's `dir` specification:
-
-```lua
-{
-  "YOUR_GITHUB_USERNAME/nvim_review",
-  name = "nvim-review",
-  main = "guided-review",
-  lazy = false,
-  opts = { quiet_ms = 800 },
-}
-```
-
-After `:Lazy sync`, run the installer from Lazy's checkout. With the default
-Neovim app name and Lazy root:
-
-```sh
-python3 "${XDG_DATA_HOME:-$HOME/.local/share}/nvim/lazy/nvim-review/scripts/install.py" \
-  --skills opencode claude
-```
-
-If you customize `NVIM_APPNAME` or Lazy's root, use the actual plugin directory
-shown by `:Lazy` instead. Use one installation source for the plugin, command and
-skill to avoid version mismatches.
-
-### Other plugin managers or manual runtime loading
-
-Add the checkout to Neovim's runtimepath and run setup:
-
-```lua
-vim.opt.rtp:prepend(vim.fn.expand("~/dev/nvim_review"))
-require("guided-review").setup({ quiet_ms = 800 })
-```
-
-Install the command and skill with the same installer. To use the skill elsewhere,
-copy or symlink the **whole** `skills/guided-review` directory, including its
-`references` folder, into the harness's skill directory. It is one shared skill,
-not two harness-specific implementations.
+</details>
 
 ## First review
 
@@ -295,22 +304,27 @@ tests/                          Unit, headless-editor and installation checks
 ## Updating and uninstalling
 
 Update the chosen checkout using Git or Lazy, then reload/restart Neovim when
-convenient. Because the command and skills are linked, they follow that checkout.
+convenient. Command and skill links created by `scripts/install.py` follow that
+checkout. If you installed the skill with the Skills CLI instead, update it
+separately with `npx skills update guided-review -g`.
 
-From the **same checkout used to install**, remove its links with:
+Before removing the plugin, open a shell in the **same checkout used to install**
+(shown by `:Lazy` for Lazy installations) and remove its links with:
 
 ```sh
 python3 scripts/install.py --uninstall --skills opencode claude
 ```
 
-Pass the same `--bin-dir` if you customized it. The uninstaller removes only its
-own symlinks, leaves replaced/user-owned paths alone by refusing the operation,
-and preserves saved review progress. Remove the plugin specification separately.
+Use the same `--skills` selection as at installation (omit it for a command-only
+install), and pass the same `--bin-dir` if you customized it. The uninstaller
+removes only its own symlinks, leaves replaced/user-owned paths alone by refusing
+the operation, and preserves saved review progress. Remove the plugin
+specification separately.
+Skills installed with the Skills CLI must instead be removed using
+`npx skills remove guided-review -g`.
 
 ## Publishing checklist
 
-- Replace `YOUR_GITHUB_USERNAME` in the installation examples after choosing the
-  repository owner.
 - Choose and add a license before inviting third-party reuse. **No license has
   been selected in this initial package.**
 - The live conversational experience still needs user testing; automated checks
