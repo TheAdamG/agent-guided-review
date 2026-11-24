@@ -12,6 +12,14 @@ def state_home():
     return Path(os.environ.get("NVIM_REVIEW_STATE_DIR", Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "nvim-guided-review"))
 
 
+def with_messages(error, messages):
+    if not messages:
+        return str(error)
+    return str(error) + "\nCaptured Neovim messages:\n" + "\n".join(
+        f"[{m['path']}: {m['phase']}]\n{m['text']}" for m in messages
+    )
+
+
 class Editor:
     def __init__(self, server):
         self.server = server
@@ -36,7 +44,7 @@ class Editor:
         except ValueError as exc:
             raise ReviewError(f"Invalid editor response: {result.stdout[:200]}") from exc
         if not reply.get("ok"):
-            raise ReviewError(reply.get("error", "Neovim refused the request"))
+            raise ReviewError(with_messages(reply.get("error", "Neovim refused the request"), reply.get("messages")))
         return reply["result"]
 
 

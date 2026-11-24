@@ -210,6 +210,7 @@ documented in [the skill reference](skills/guided-review/references/bridge.md).
 | `:GuidedReviewPause` | Block agent navigation while you work. |
 | `:GuidedReviewResume` | Allow navigation again. |
 | `:GuidedReviewInfo` | Show the attached controller and last published progress. |
+| `:GuidedReviewMessages` | Read captured navigation messages in a scrollable, read-only window; close with `:q`. |
 
 The plugin adds no mappings, changes no terminal layout, and never takes Herdr
 keyboard focus. It refuses navigation in editing/prompt modes and briefly after
@@ -255,6 +256,18 @@ needed. Progress survives restarts; resumption rechecks the current content.
   `NVIM_REVIEW_OWNER`; there is no shared default owner.
 - **Busy or paused:** return to normal mode or use `:GuidedReviewResume`. The
   agent should wait, not force its way past an active editing session.
+- **“Press ENTER or type command to continue”:** Neovim is waiting for a message
+  acknowledgement, not frozen. Press Enter yourself; use `:messages` afterwards
+  to investigate the preceding output. Multi-line plugin/autocommand messages
+  can cause this, especially with `cmdheight=0`. Review navigation captures
+  synchronous file-opening/reload messages, returns them to the agent, and keeps
+  them available through `:GuidedReviewMessages` (or `nvim-review messages`) until
+  Neovim exits. This includes output printed before an error; thrown errors still
+  fail the request. The agent must report warnings/errors rather than treating
+  successful navigation as proof that plugin work succeeded. Navigation also
+  checks only the target buffer for external changes. It
+  never automatically dismisses prompts; asynchronous plugin messages or truly
+  interactive prompts may still need your attention.
 - **Stale stop:** the agent refreshes inventory, reads the changed source and
   revises the route. Repeatedly jumping to old line numbers is not the fix.
 - **Installer collision:** inspect the existing path before moving anything aside.
@@ -269,7 +282,8 @@ From this checkout, with Git and Neovim on PATH:
 python3 -B -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
-Tests use disposable worktrees, state directories and headless `nvim -u NONE`.
+Tests use disposable worktrees, state directories and `nvim -u NONE`, both
+headless and in a pseudo-terminal to catch blocking message prompts.
 Installer tests use a disposable HOME. They do not load your personal Neovim
 configuration, install packages or stage anything in a real project.
 

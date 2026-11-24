@@ -1,11 +1,17 @@
 """Run: python3 -m unittest discover -s tests -p test_guided_review.py -v"""
 
 import copy
+import fcntl
 import json
 import os
+import pty
+import select
+import struct
 import subprocess
 import sys
 import tempfile
+import termios
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -202,7 +208,7 @@ class StateTests(RepositoryCase):
             make_plan(self.root, document, snap, self.state())
 
 
-class EditorIntegrationTests(RepositoryCase):
+class EditorCase(RepositoryCase):
     def setUp(self):
         super().setUp()
         self.environment = {
@@ -214,12 +220,10 @@ class EditorIntegrationTests(RepositoryCase):
         self.environment.pop("HC_SCOPE", None)
         self.socket = str(self.directory / "nvim.sock")
         self.log = (self.directory / "nvim.log").open("w+")
-        self.process = subprocess.Popen(
-            ["nvim", "--headless", "-u", "NONE", "-i", "NONE", "--listen", self.socket,
+        self.process = self.launch_editor(
+            ["nvim", "-u", "NONE", "-i", "NONE", "--listen", self.socket,
              "--cmd", "lua vim.opt.rtp:prepend(vim.env.NVIM_REVIEW_PLUGIN_DIR)",
-             "-c", "lua require('guided-review').setup({quiet_ms=0})"],
-            cwd=self.root, env=self.environment, stdout=self.log, stderr=self.log,
-        )
+             "-c", "lua require('guided-review').setup({quiet_ms=0})"])
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             if Path(self.socket).exists() and list((self.directory / "state/editors").glob("*.json")):
@@ -230,6 +234,12 @@ class EditorIntegrationTests(RepositoryCase):
             time.sleep(0.01)
         else:
             self.fail("Neovim registration timed out")
+
+    def launch_editor(self, argv):
+        return subprocess.Popen(
+            [argv[0], "--headless", *argv[1:]],
+            cwd=self.root, env=self.environment, stdout=self.log, stderr=self.log,
+        )
 
     def tearDown(self):
         if hasattr(self, "process"):
@@ -266,6 +276,8 @@ class EditorIntegrationTests(RepositoryCase):
         self.command("start")
         self.command("plan", "--file", "-", stdin=json.dumps(document or self.plan(snap)))
 
+
+class EditorIntegrationTests(EditorCase):
     def test_full_walkthrough_navigation_preview_and_no_git_mutation(self):
         before = (self.root / ".git/index").read_bytes()
         snap = self.command("inventory", server=False)  # discovery, not just explicit socket
@@ -434,6 +446,149 @@ class EditorIntegrationTests(RepositoryCase):
         (records / "another.json").write_text(json.dumps(record))
         self.assertIn("No unique editor", self.command("inventory", server=False, success=False))
         self.assertTrue(self.command("inventory")["files"])
+
+
+class TerminalEditorTests(EditorCase):
+    """A real terminal is needed: headless Neovim never waits at hit-enter."""
+
+    def launch_editor(self, argv):
+        self.master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
+        self.environment["TERM"] = "xterm-256color"
+        process = subprocess.Popen(
+            [*argv, "-c", "set cmdheight=0"], cwd=self.root, env=self.environment,
+            stdin=slave, stdout=slave, stderr=slave,
+        )
+        os.close(slave)
+        self.terminal_output = bytearray()
+        self.reader_stop = threading.Event()
+
+        def drain():
+            while not self.reader_stop.is_set():
+                if select.select([self.master], [], [], 0.02)[0]:
+                    try:
+                        self.terminal_output.extend(os.read(self.master, 65536))
+                    except OSError:
+                        break
+
+        self.reader = threading.Thread(target=drain, daemon=True)
+        self.reader.start()
+        return process
+
+    def tearDown(self):
+        try:
+            super().tearDown()
+        finally:
+            self.reader_stop.set()
+            self.reader.join(timeout=1)
+            os.close(self.master)
+
+    def test_navigation_messages_do_not_block_rpc(self):
+        self.install_plan()
+        self.lua("vim.api.nvim_create_autocmd({'BufReadPost', 'BufEnter'}, {callback=function() "
+                 "vim.g.review_hook_runs = (vim.g.review_hook_runs or 0) + 1; "
+                 "print('plugin notification\\nsecond line') end}); return true")
+        for height in (0, 1):
+            with self.subTest(cmdheight=height):
+                self.lua(f"vim.o.cmdheight = {height}; return true")
+                result = self.command("show", "behavior")
+                self.assertEqual(result["location"]["line"], 3)
+                self.assertIn("plugin notification\nsecond line", "\n".join(m["text"] for m in result["messages"]))
+                visit = self.command("visit", "deleted.txt", "1")
+                self.assertIn("plugin notification\nsecond line", "\n".join(m["text"] for m in visit["messages"]))
+                self.assertEqual(self.lua("return vim.api.nvim_get_mode().mode"), "n")
+                self.assertEqual(self.lua("return vim.o.cmdheight"), str(height))
+        self.assertGreater(int(self.lua("return vim.g.review_hook_runs")), 0)
+        self.assertNotIn(b"Press ENTER or type command to continue", self.terminal_output)
+
+    def test_navigation_errors_are_reported_not_silenced(self):
+        self.install_plan()
+        self.lua("vim.api.nvim_create_autocmd('BufReadPost', {callback=function() "
+                 "print('message before failure'); error('review-test-load-failure') end}); return true")
+        error = self.command("show", "behavior", success=False)
+        self.assertIn("review-test-load-failure", error)
+        self.assertIn("message before failure", error)
+        self.assertEqual(self.command("status")["reviewed_count"], 0)
+        self.assertEqual(self.lua("return vim.api.nvim_get_mode().mode"), "n")
+        self.assertNotIn(b"Press ENTER or type command to continue", self.terminal_output)
+
+    def test_printed_and_notified_failures_are_returned_and_retained(self):
+        self.install_plan()
+        self.lua("vim.api.nvim_create_autocmd('BufReadPost', {pattern='*source.txt', callback=function() "
+                 "print('printed failure\\nsecond line'); "
+                 "vim.notify('plugin warning', vim.log.levels.WARN) end}); return true")
+        result = self.command("show", "behavior")
+        output = "\n".join(m["text"] for m in result["messages"])
+        for text in ("printed failure\nsecond line", "plugin warning"):
+            self.assertIn(text, output)
+        self.assertTrue(all(m["path"] == "source.txt" for m in result["messages"]))
+        self.command("visit", "deleted.txt", "1")
+        self.command("inventory")
+        self.assertEqual(self.command("messages")["messages"], result["messages"])
+        self.lua("vim.cmd('GuidedReviewMessages'); return true")
+        view = json.loads(self.lua("return vim.json.encode(vim.api.nvim_buf_get_lines(0, 0, -1, false))"))
+        self.assertIn("plugin warning", "\n".join(view))
+        self.assertEqual(self.lua("return tostring(vim.bo.modifiable)"), "false")
+        self.assertEqual(self.lua("return vim.api.nvim_get_mode().mode"), "n")
+        self.assertNotIn(b"Press ENTER or type command to continue", self.terminal_output)
+
+    def test_error_notifications_and_prior_messages_are_not_lost(self):
+        self.install_plan()
+        self.lua("vim.api.nvim_create_autocmd('BufReadPost', {pattern='*source.txt', callback=function() "
+                 "print('before error notification'); vim.notify('plugin error', vim.log.levels.ERROR) end}); return true")
+        error = self.command("show", "behavior", success=False)
+        self.assertIn("plugin error", error)
+        self.assertIn("before error notification", error)
+        messages = self.command("messages")["messages"]
+        self.assertIn("before error notification", messages[0]["text"])
+        self.assertIn("plugin error", messages[0]["error"])
+        self.assertEqual(self.lua("return vim.api.nvim_get_mode().mode"), "n")
+        self.assertNotIn(b"Press ENTER or type command to continue", self.terminal_output)
+
+    def test_messages_survive_post_navigation_revision_refusal(self):
+        self.install_plan()
+        self.lua("vim.api.nvim_create_autocmd('BufEnter', {pattern='*source.txt', callback=function() "
+                 "print('plugin changed source'); vim.api.nvim_buf_set_lines(0, 0, 1, false, {'plugin edit'}) end}); return true")
+        error = self.command("show", "behavior", success=False)
+        self.assertIn("Source changed while opening it", error)
+        self.assertIn("plugin changed source", error)
+        self.assertIn("plugin changed source", self.command("messages")["messages"][0]["text"])
+        self.assertNotIn(b"Press ENTER or type command to continue", self.terminal_output)
+
+    def test_reload_errors_preserve_messages_and_restore_autoread(self):
+        self.install_plan()
+        self.command("show", "behavior")
+        self.lua("vim.bo.autoread = false; "
+                 "vim.api.nvim_create_autocmd('FileChangedShellPost', {callback=function() "
+                 "print('before reload error'); error('reload failure') end}); return true")
+        (self.root / "source.txt").write_text("updated source\n" * 5)
+        snap = self.command("inventory")
+        self.command("plan", "--file", "-", stdin=json.dumps(self.plan(snap)))
+        error = self.command("show", "behavior", success=False)
+        self.assertIn("before reload error", error)
+        self.assertIn("reload failure", error)
+        self.assertEqual(self.lua("return tostring(vim.bo.autoread)"), "false")
+        self.assertNotIn(b"Press ENTER or type command to continue", self.terminal_output)
+
+    def test_reload_messages_are_quiet_and_only_target_is_checked(self):
+        self.install_plan()
+        self.command("show", "behavior")
+        self.lua("local b = vim.fn.bufadd('deleted.txt'); vim.fn.bufload(b); "
+                 "vim.bo[b].autoread = false; vim.bo.autoread = false; "
+                 "vim.api.nvim_create_autocmd('FileChangedShell', {pattern='*deleted.txt', callback=function() "
+                 "vim.g.unrelated_checked = true end}); "
+                 "vim.api.nvim_create_autocmd('FileChangedShellPost', {callback=function() "
+                 "print('reload notification\\nsecond line') end}); return true")
+        (self.root / "deleted.txt").write_text("external unrelated change\n")
+        (self.root / "source.txt").write_text("updated source\n" * 5)
+        snap = self.command("inventory")
+        self.command("plan", "--file", "-", stdin=json.dumps(self.plan(snap)))
+        result = self.command("show", "behavior")
+        self.assertEqual(result["location"]["lines"], ["updated source"] * 5)
+        self.assertIn("reload notification\nsecond line", "\n".join(m["text"] for m in result["messages"]))
+        self.assertEqual(self.lua("return tostring(vim.bo.autoread)"), "false")
+        self.assertEqual(self.lua("return tostring(vim.g.unrelated_checked)"), "nil")
+        self.assertNotIn(b"Press ENTER or type command to continue", self.terminal_output)
 
 
 if __name__ == "__main__":

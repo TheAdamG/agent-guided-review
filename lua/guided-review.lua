@@ -7,6 +7,51 @@ local last_activity = 0
 local quiet_ms = 800
 local automation = false
 local historical = {}
+local message_log = {}
+local capture_id = 0
+
+local function message_lines(messages)
+  local lines = {}
+  for _, message in ipairs(messages) do
+    lines[#lines + 1] = ("[%s: %s]"):format(message.path, message.phase)
+    vim.list_extend(lines, vim.split(message.text, "\n", { plain = true }))
+    if message.error then
+      vim.list_extend(lines, vim.split(message.error, "\n", { plain = true }))
+    end
+    lines[#lines + 1] = ""
+  end
+  return lines
+end
+
+local function capture_navigation(request, messages, win, phase, commands)
+  -- Catch inside win_execute so output printed *before* an error is returned
+  -- too. Rethrow afterwards: neither :silent! nor error-message filtering is used.
+  local key
+  repeat
+    capture_id = capture_id + 1
+    key = "guided_review_capture_error_" .. capture_id
+  until vim.w[win][key] == nil
+  local script = { "try" }
+  vim.list_extend(script, commands)
+  vim.list_extend(script, { "catch", "let w:" .. key .. " = v:exception", "endtry" })
+  local ok, output = pcall(vim.fn.win_execute, win, script)
+  local err
+  if vim.api.nvim_win_is_valid(win) then
+    err = vim.w[win][key]
+    vim.w[win][key] = nil
+  end
+  if not ok then
+    err, output = tostring(output), ""
+  end
+  if output ~= "" or err then
+    local message = { path = request.path, phase = phase, text = output, error = err }
+    messages[#messages + 1] = message
+    message_log[#message_log + 1] = message
+  end
+  if err then
+    error(err)
+  end
+end
 
 local function state_home()
   return vim.env.NVIM_REVIEW_STATE_DIR
@@ -145,6 +190,26 @@ function M.setup(opts)
   vim.api.nvim_create_user_command("GuidedReviewInfo", function()
     vim.notify(vim.inspect({ owner = owner, repo = repo, paused = paused == true, progress = vim.g.guided_review }))
   end, {})
+  vim.api.nvim_create_user_command("GuidedReviewMessages", function()
+    local lines = message_lines(message_log)
+    if #lines == 0 then
+      lines = { "No guided-review navigation messages captured in this Neovim session." }
+    end
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.bo[buf].bufhidden = "wipe"
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+    vim.bo[buf].modifiable = false
+    vim.api.nvim_open_win(buf, true, {
+      relative = "editor",
+      row = 1,
+      col = 1,
+      width = math.max(1, math.min(100, vim.o.columns - 4)),
+      height = math.max(1, math.min(#lines, vim.o.lines - 4)),
+      style = "minimal",
+      border = "rounded",
+      title = " Guided review messages (:q to close) ",
+    })
+  end, {})
   vim.api.nvim_create_user_command("GuidedReviewPause", function()
     paused = true
   end, {})
@@ -188,7 +253,7 @@ local function context(request)
   }
 end
 
-local function show(request)
+local function show(request, messages)
   check(request)
   local path = request.repo .. "/" .. request.path
   local real = uv.fs_realpath(path) or vim.fs.normalize(path)
@@ -215,13 +280,15 @@ local function show(request)
       error("Open only source files up to 1 MiB")
     end
     buf = vim.fn.bufadd(path)
-    vim.fn.bufload(buf)
+    -- Capture navigation chatter, including synchronous autocmd messages. With
+    -- cmdheight=0 these can otherwise enter hit-enter *inside* the RPC request,
+    -- before check() can detect a busy editor. Return and retain captured output.
+    -- Only buffer/window numbers enter these commands, never source paths.
+    capture_navigation(request, messages, win, "load", { "call bufload(" .. buf .. ")" })
     if not vim.bo[buf].modified then
       local autoread = vim.bo[buf].autoread
       vim.bo[buf].autoread = true
-      local ok, err = pcall(vim.api.nvim_buf_call, buf, function()
-        vim.cmd("checktime")
-      end)
+      local ok, err = pcall(capture_navigation, request, messages, win, "reload", { "checktime " .. buf })
       vim.bo[buf].autoread = autoread
       if not ok then
         error(err)
@@ -238,11 +305,11 @@ local function show(request)
   if request.end_line and request.end_line > vim.api.nvim_buf_line_count(buf) then
     error("Requested range no longer exists. Refresh context and revise the review stop")
   end
-  vim.api.nvim_win_set_buf(win, buf)
-  vim.api.nvim_win_set_cursor(win, { line, 0 })
-  vim.api.nvim_win_call(win, function()
-    vim.cmd("normal! zvzz")
-  end)
+  capture_navigation(request, messages, win, "navigate", {
+    ("call nvim_win_set_buf(%d, %d)"):format(win, buf),
+    ("call nvim_win_set_cursor(%d, [%d, 0])"):format(win, line),
+    "normal! zvzz",
+  })
   return context(request)
 end
 
@@ -263,11 +330,13 @@ local function snapshot()
   return { buffers = buffers, server = vim.v.servername, owner = owner, repo = repo, paused = paused == true }
 end
 
-local function dispatch(request)
+local function dispatch(request, messages)
   if request.action == "snapshot" then
     return snapshot()
   elseif request.action == "context" then
     return context(request)
+  elseif request.action == "messages" then
+    return { messages = message_log }
   elseif request.action == "claim" then
     if owner and (owner ~= request.owner or repo ~= request.repo) and not request.take_over then
       error("Another review controls this editor. Ask the user before taking it over")
@@ -292,7 +361,7 @@ local function dispatch(request)
     check(request)
     return snapshot()
   elseif request.action == "show" then
-    return show(request)
+    return show(request, messages)
   elseif request.action == "preview" then
     check(request)
     local win = source_window()
@@ -331,17 +400,21 @@ local function dispatch(request)
 end
 
 function M.rpc(payload)
+  local messages = {}
   local ok, result = pcall(function()
     M.setup()
     local request = vim.json.decode(payload)
     automation = true
-    return dispatch(request)
+    return dispatch(request, messages)
   end)
   automation = false
   if ok then
+    if #messages > 0 then
+      result.messages = messages
+    end
     return vim.json.encode({ ok = true, result = result })
   end
-  return vim.json.encode({ ok = false, error = tostring(result) })
+  return vim.json.encode({ ok = false, error = tostring(result), messages = messages })
 end
 
 return M

@@ -53,6 +53,7 @@ nvim-review show validation
 nvim-review show validation --location 2
 nvim-review preview
 nvim-review context
+nvim-review messages
 nvim-review visit src/queue.ts 20
 nvim-review show validation
 nvim-review next
@@ -66,6 +67,17 @@ nvim-review resume
 `next` and `skip` require that the current stop was shown at the current revision.
 After the last stop, they return a summary instead of another stop. Unresolved
 stops can be revisited with `show ID`, discussed, and accepted with `next`.
+
+Navigation results include a `messages` array when output was captured (`show`
+always includes the array, possibly empty). Each entry has `path`, `phase`, and
+the unfiltered `text`; failed commands also have `error`. Phases are `load`,
+`reload`, and `navigate`. Output has no reliable severity classification: plugins
+can print failures as ordinary text. Error responses include the captured text
+alongside the error. `messages` reads the full in-memory log for this Neovim
+session without navigating or requiring an active review. The user can read the
+same log in a scrollable window using `:GuidedReviewMessages` and close it with
+`:q`. These messages cover synchronous command output, not custom notification
+UIs or asynchronous plugin messages, which remain under those plugins' control.
 
 If a file or Git baseline changed, the bridge refuses stale navigation/approval.
 Refresh inventory, read the updated source/context, then send an updated plan.

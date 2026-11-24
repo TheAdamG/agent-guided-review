@@ -7,7 +7,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .editor import discover, select_server
+from .editor import discover, select_server, with_messages
 from .git import ReviewError, digest, inventory, previous_content, repository, safe_path
 from .session import locked_session, make_plan, refresh, revisions, summary
 
@@ -35,6 +35,7 @@ def parser():
     commands.add_parser("status", help="Refresh progress, stale decisions and unclassified changes")
     commands.add_parser("summary", help="Final honest coverage and manual-staging readiness")
     commands.add_parser("context", help="Read the current editor location and surrounding (possibly unsaved) source")
+    commands.add_parser("messages", help="Read captured navigation messages from this Neovim session")
     commands.add_parser("preview", help="Show the existing floating hunk preview, or previous-source fallback")
     visit = commands.add_parser("visit", help="Detour to supporting source without changing the current stop")
     visit.add_argument("path")
@@ -97,17 +98,22 @@ def show(editor, root, state, snapshot, stop, location_number=1):
     check_source(target)
     historical = previous_content(root, location["path"]) if not target.exists() else None
     result = editor.call("show", repo=str(root), owner=state["owner"], **location, historical=historical)
+    messages = result.pop("messages", [])
     # Recheck after buffer load/checktime and its user autocmds. Never certify
     # that a stale location was shown if loading itself changed the content.
-    after = capture(root, editor, locations(state))
-    if stop["revision"] != revisions(stop, after):
-        stop["status"] = "changed"
-        stop.pop("shown_revision", None)
-        raise ReviewError("Source changed while opening it. Refresh inventory and revise the stop")
-    stop["shown_revision"] = revisions(stop, after)
-    state["current"] = stop["id"]
-    publish(editor, state)
-    return {"stop": stop, "location": result, "instruction": "Explain this stop in the agent pane, then wait for the user."}
+    try:
+        after = capture(root, editor, locations(state))
+        if stop["revision"] != revisions(stop, after):
+            stop["status"] = "changed"
+            stop.pop("shown_revision", None)
+            raise ReviewError("Source changed while opening it. Refresh inventory and revise the stop")
+        stop["shown_revision"] = revisions(stop, after)
+        state["current"] = stop["id"]
+        publish(editor, state)
+    except ReviewError as exc:
+        raise ReviewError(with_messages(exc, messages)) from exc
+    return {"stop": stop, "location": result, "messages": messages,
+            "instruction": "Report any captured warnings/errors, explain this stop in the agent pane, then wait for the user."}
 
 
 def run(args):
@@ -117,6 +123,8 @@ def run(args):
     editor = select_server(root, args.server)
     if args.command == "context":
         return editor.call("context", repo=str(root))
+    if args.command == "messages":
+        return editor.call("messages", repo=str(root))
     if args.command == "inventory":
         return capture(root, editor)
     read_only = args.command in ("status", "summary")

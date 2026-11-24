@@ -55,7 +55,13 @@ an unresolved question rather than declaring success.
 ## Walk through one stop, then wait
 
 Call `show <id>`. Check its successful response **before claiming the editor has
-moved**. Explain this stop here, usually in a few short paragraphs:
+moved**. Inspect returned `messages`: report warnings, printed failures, and output
+whose significance is unclear before proceeding. Navigation can succeed even when
+a plugin reports a failure as plain text. Captured output remains available via
+`nvim-review messages` and the user's `:GuidedReviewMessages` window, including
+messages from failed navigation requests.
+
+Explain this stop here, usually in a few short paragraphs:
 
 - **Where we are:** the purpose of this code and its role in the feature.
 - **Before and after:** enough existing behavior to make this change meaningful.
